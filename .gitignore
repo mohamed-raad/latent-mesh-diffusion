@@ -1,0 +1,69 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Virtual env
+.venv/
+.venv_*/
+
+# Data (generated at runtime)
+bin_data/
+checkpoints/
+nodes/
+training_logs/
+logs/
+*.bin
+
+# HuggingFace cache
+.huggingface/
+.cache/
+
+# Temp/backup
+backup-*/
+backup_*/
+*.tmp
+*.bak
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Ruff
+.ruff_cache/
+.pytest_cache/
+
+# Environment
+.env
+.env.*
+
+# IDE
+.vscode/
+.idea/
+
+# Large generated files
+*.parquet
+*.arrow
+*.pt
+*.pth
+
+# Generated curriculum/training artifacts
+NoProp/agk_data/
+NoProp/agk_llm/
+NoProp/curriculum_data/
+NoProp/curriculum_tokens.jsonl
+NoProp/ingested_data/
+NoProp/benchmarks/*.csv
+NoProp/eval_reports/
+NoProp/training_status.json
+
+# Vendored repos (read-only reference)
+DeepSpec/
+gemma/
+Cola-DLM/
+
+# Documentation (generated)
+NoProp/DOCUMENTATION.md
+NoProp/README.md
