@@ -65,12 +65,18 @@ trainer = MeshTrainer(
     hub_token=args.token,
 )
 
-# 2. Pull core from Hub (loads latest master checkpoint)
+# 2. Pull core from Hub (loads latest master checkpoint) — retry until master pushes
 if trainer.hub_sync is not None:
-    pulled = trainer.pull_core_from_hub(trainer.hub_sync)
+    pulled = False
+    for attempt in range(60):
+        pulled = trainer.pull_core_from_hub(trainer.hub_sync)
+        if pulled:
+            break
+        if attempt == 0:
+            print("  No master checkpoint yet — retrying every 10s (master pushes every 500 steps)...")
+        time.sleep(10)
     if not pulled:
-        print("  No master checkpoint found on Hub — waiting for master to push first.")
-        print(f"  Check {HUB_REPO} for a step_*.pt file.")
+        print("  Timed out waiting for master checkpoint.")
         sys.exit(1)
 else:
     print("  HubSync not available — check HF_TOKEN")
