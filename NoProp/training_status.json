@@ -1,0 +1,15 @@
+{
+  "step": 0,
+  "loss_history": [],
+  "steps_per_sec": 0,
+  "node_count": 0,
+  "gpu": {},
+  "vram_pct": 0,
+  "benchmarks": {},
+  "workflow": {
+    "current": "running",
+    "progress": "Epoch 1/3  Batch 1100/1207  Step 1100  AvgLoss 0.011058  Nodes 1  NodeIDs ['seed_default']",
+    "started_at": 1783506588.0065963
+  },
+  "generation_stats": {}
+}
