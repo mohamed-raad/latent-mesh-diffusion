@@ -8,6 +8,7 @@ dependencies = [
     "torchvision",
     "transformers",
     "bitsandbytes",
+    "huggingface-hub>=0.20",
     "tqdm",
     "datasets>=5.0.0",
     "pynvml>=13.0.1",

@@ -1,4 +1,5 @@
 import gc
+import math
 import glob
 import os
 import signal
@@ -22,6 +23,7 @@ from agk_dataset import AGKDataset
 from dspark_speculator import CurriculumDataset, DSparkSpeculator
 from export_utils import export_to_gguf, export_to_onnx, export_to_safetensors
 from global_cognitive_layer import ConsensusMechanism, GlobalCognitiveLayer, ToolManager
+from hub_sync import HubSync
 from lifecycle_manager import LifecycleManager
 from memory_manager import MemoryManager, MemoryTier
 from mesh_router import (
@@ -699,6 +701,8 @@ class MeshTrainer:
         quant_patience: int = 50,
         expert_registry_path: str | None = None,
         mesh_memory_path: str | None = None,
+        hub_repo: str | None = None,
+        hub_token: str | None = None,
     ):
         # Load model size preset
         self.preset = get_preset(model_size)
@@ -732,6 +736,8 @@ class MeshTrainer:
         self.train_experts_only = train_experts_only
         self.domain = domain
         self.experts_count = experts_count
+        self.hub_repo = hub_repo
+        self.hub_sync: HubSync | None = None
 
         self.dynamic_quantizer = DynamicQuantizer(patience=quant_patience) if use_dynamic_quant else None
         self.expert_registry = ExpertRegistry(expert_registry_path) if expert_registry_path else None
@@ -1394,12 +1400,103 @@ class MeshTrainer:
                                          min_loss_window=10 if self.step > 100 else 0)
         return merged, pruned
 
+    # ── multi-notebook helpers ────────────────────────────────────────
+
+    def freeze_experts(self, expert_ids: list[str] | None = None):
+        """Freeze (requires_grad=False) specific expert blocks, or all if None."""
+        ids = expert_ids or list(self.router.nodes.keys())
+        for eid in ids:
+            block = self.tier_manager.get_block(eid)
+            if block is not None:
+                block.requires_grad_(False)
+                block.optimizer = None  # drop optimizer — will be recreated with only unfrozen params
+
+    def unfreeze_experts(self, expert_ids: list[str] | None = None):
+        """Unfreeze (requires_grad=True) specific expert blocks, or all if None."""
+        ids = expert_ids or list(self.router.nodes.keys())
+        for eid in ids:
+            block = self.tier_manager.get_block(eid)
+            if block is not None:
+                block.requires_grad_(True)
+                block.optimizer = None  # force re-creation on next local_step
+
+    def save_expert_weights(self, expert_id: str, save_dir: str) -> str:
+        """Save a single expert's block weights + metadata to *save_dir*/expert_<id>.pt.
+        Returns the path saved."""
+        os.makedirs(save_dir, exist_ok=True)
+        block = self.tier_manager.get_block(expert_id)
+        node = self.router.nodes.get(expert_id)
+        path = os.path.join(save_dir, f"expert_{expert_id}.pt")
+        torch.save({
+            "node_id": expert_id,
+            "block_state": block.state_dict() if block else {},
+            "anchor": node.anchor_embedding.cpu() if node and node.anchor_embedding is not None else None,
+            "rolling_loss": node.rolling_loss if node else [],
+            "metadata": {
+                "domain": getattr(node, "domain", ""),
+                "version": getattr(node, "version", "1.0"),
+            },
+        }, path)
+        return path
+
+    def load_expert_weights(self, expert_id: str, load_dir: str) -> bool:
+        """Load a single expert's block weights from *load_dir*/expert_<id>.pt.
+        Returns True on success."""
+        path = os.path.join(load_dir, f"expert_{expert_id}.pt")
+        if not os.path.isfile(path):
+            return False
+        data = torch.load(path, map_location="cpu", weights_only=True)
+        block = self._ensure_block(expert_id)
+        if block is not None and "block_state" in data and data["block_state"]:
+            block.load_state_dict(data["block_state"])
+        node = self.router.nodes.get(expert_id)
+        if node is not None:
+            anchor = data.get("anchor")
+            if anchor is not None:
+                node.anchor_embedding = anchor
+            node.rolling_loss = data.get("rolling_loss", [])
+        return True
+
+    def push_expert_shard(self, hub_sync: "HubSync", expert_ids: list[str]):
+        """Push this notebook's expert shard to HF Hub with a shard tag."""
+        shard_dir = os.path.join(self.checkpoint_dir, f"shard_{hub_sync.notebook_id}")
+        for eid in expert_ids:
+            self.save_expert_weights(eid, shard_dir)
+        hub_sync.push(shard_dir, f"shard_{hub_sync.notebook_id}")
+        print(f"  Pushed expert shard ({len(expert_ids)} experts) to {hub_sync.repo_id}")
+
+    def pull_core_from_hub(self, hub_sync: "HubSync") -> bool:
+        """Pull the latest master checkpoint and load only core weights.
+        Returns True if successfully loaded."""
+        latest = hub_sync.checkout_latest(self.checkpoint_dir)
+        if latest is None:
+            return False
+        data = torch.load(latest, map_location="cpu", weights_only=True)
+        mesh_state = data.get("model_state_dict", {}).get("mesh", {})
+        if not mesh_state:
+            mesh_state = data
+        canvas_state = mesh_state.get("canvas_state")
+        if canvas_state is not None and self.canvas is not None:
+            self.canvas.model.load_state_dict(canvas_state)
+        # Load expert anchors/router_state but NOT block weights (workers train those)
+        router_state = mesh_state.get("router_state", {})
+        for node_id, st in router_state.items():
+            node = self.router.nodes.get(node_id)
+            if node is not None:
+                anchor = st.get("anchor")
+                if anchor is not None:
+                    node.anchor_embedding = anchor
+                node.rolling_loss = st.get("rolling_loss", [])
+        print(f"  Pulled core checkpoint from {hub_sync.repo_id} (step {mesh_state.get('step', '?')})")
+        return True
+
     def train(
         self,
         dataset: Dataset,
         num_epochs: int = 10,
         batch_size: int = 8,
         log_interval: int = 10,
+        val_interval: int = 500,
         mitosis_interval: int = 50,
         ckpt_interval: int = 100,
         resume: bool = True,
@@ -1408,9 +1505,25 @@ class MeshTrainer:
         use_packing: bool = False,
         domain_ids: list[str] | None = None,
         dashboard=None,
+        val_dataset: Dataset | None = None,
+        hub_repo: str | None = None,
+        multi_notebook: bool = False,
     ):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.tier_manager.set_device(device)
+
+        # HubSync initialisation
+        hub_repo = hub_repo or self.hub_repo
+        if hub_repo:
+            try:
+                self.hub_sync = HubSync(repo_id=hub_repo)
+                if multi_notebook:
+                    self.hub_sync.advertise()
+                latest = self.hub_sync.checkout_latest(self.checkpoint_dir)
+                if latest:
+                    print(f"  HubSync: pulled {os.path.basename(latest)} from {hub_repo}")
+            except Exception as e:
+                print(f"  HubSync init skipped ({e})")
 
         if resume:
             self._load_checkpoint()
@@ -1465,6 +1578,11 @@ class MeshTrainer:
             loader = DataLoader(dataset, batch_size=batch_size, shuffle=(not is_iterable and collate_fn is None), collate_fn=collate_fn)
             total_batches = len(loader) if not is_iterable else 999999
 
+        _step_times = deque(maxlen=100)
+        _step_n_tokens = deque(maxlen=100)
+        total_steps_planned = max_steps if max_steps > 0 else total_batches * num_epochs
+        train_start_time = time.time()
+
         for epoch in range(num_epochs):
             epoch_losses: list[float] = []
             self._domain_ids = domain_ids or []
@@ -1516,12 +1634,14 @@ class MeshTrainer:
                     else:
                         _loss_mask = None
 
+                _t0 = time.perf_counter()
                 if self.prefetch_stream is not None or torch.cuda.is_available():
                     node_losses = self._train_step_streamed(x, target, t, domain_ids=domain_ids,
                                                            padding_mask=_loss_mask if segment_ids is not None else None)
                 else:
                     node_losses = self._train_step(x, target, t, domain_ids=domain_ids,
                                                    padding_mask=_loss_mask if segment_ids is not None else None)
+                _dt = time.perf_counter() - _t0
 
                 if profiler:
                     profiler.tick_end("forward")
@@ -1530,13 +1650,17 @@ class MeshTrainer:
                 epoch_losses.append(avg_loss)
                 self.global_losses.append(avg_loss)
 
+                _n_tok = x.numel()
+                _step_times.append(_dt)
+                _step_n_tokens.append(_n_tok)
+
                 self.step += 1
 
                 if dashboard:
                     router_entropy = getattr(self.router, 'compute_routing_entropy', lambda: 0.0)()
                     dashboard.log_step(
                         loss=avg_loss, lr=self.lr, vram_gb=torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else 0,
-                        tok_s=0, num_gpu_experts=len(node_losses), router_entropy=router_entropy,
+                        tok_s=tok_s, num_gpu_experts=len(node_losses), router_entropy=router_entropy,
                         expert_losses=node_losses, phase=getattr(self, '_current_phase', ''),
                     )
 
@@ -1557,11 +1681,20 @@ class MeshTrainer:
 
                 if self.step % log_interval == 0 and not use_packing:
                     mem_stats = self.memory_manager.get_stats()
+                    avg_s = sum(_step_times) / max(len(_step_times), 1)
+                    avg_tok = sum(_step_n_tokens) / max(len(_step_n_tokens), 1)
+                    tok_s = avg_tok / avg_s if avg_s > 0 else 0
+                    elapsed = time.time() - train_start_time
+                    steps_done = self.step - (epoch * total_batches + batch_idx) + 1
+                    remaining = total_steps_planned - self.step
+                    eta_s = remaining * avg_s if remaining > 0 else 0
+                    eta_str = f"{int(eta_s//3600):02d}:{int((eta_s%3600)//60):02d}:{int(eta_s%60):02d}" if eta_s < 86400 else f"{eta_s/3600:.1f}h"
                     if self.core_only:
                         print(
                             f"Epoch {epoch+1}/{num_epochs}  Batch {batch_idx+1}/{total_batches}  "
                             f"Step {self.step}  CoreLoss {avg_loss:.6f}  "
-                            f"Canvas {self.canvas_len}x{self.canvas_steps}"
+                            f"Canvas {self.canvas_len}x{self.canvas_steps}  "
+                            f"{tok_s:,.0f} tok/s  {avg_s*1000:.1f}ms/step  ETA {eta_str}"
                         )
                     else:
                         tiers = self.tier_manager.summary()
@@ -1575,6 +1708,7 @@ class MeshTrainer:
                             f"Epoch {epoch+1}/{num_epochs}  Batch {batch_idx+1}/{total_batches}  "
                             f"Step {self.step}  AvgLoss {avg_loss:.6f}  "
                             f"Experts {n_experts}  "
+                            f"{tok_s:,.0f} tok/s  {avg_s*1000:.1f}ms/step  ETA {eta_str}  "
                             f"CacheHit {hit_rate:.0f}%  "
                             f"GPU[{tiers['gpu']}] RAM[{tiers['ram']}] Disk[{tiers['disk']}]  "
                             f"NodeIDs {list(node_losses.keys())}"
@@ -1633,7 +1767,24 @@ class MeshTrainer:
                     if pruned:
                         print(f"Prune: removed {pruned}")
 
-                # Lifecycle tick every 50 steps
+                # Refresh Hub advertisement periodically (multi-notebook)
+                if self.hub_sync is not None and multi_notebook and self.step % 50 == 0:
+                    self.hub_sync.refresh_advertisement()
+
+                # Validation
+                if val_dataset is not None and self.step % val_interval == 0:
+                    val_metrics = self._validate(val_dataset, device)
+                    perplexity = math.exp(min(val_metrics["loss"], 20))
+                    print(f"  VALIDATION — loss {val_metrics['loss']:.4f}  "
+                          f"perplexity {perplexity:.2f}  "
+                          f"top1 {val_metrics['top1']:.2%}  "
+                          f"top5 {val_metrics['top5']:.2%}")
+                    if dashboard:
+                        dashboard.writer.add_scalar("eval/loss", val_metrics["loss"], self.step)
+                        dashboard.writer.add_scalar("eval/perplexity", perplexity, self.step)
+                        dashboard.writer.add_scalar("eval/top1_accuracy", val_metrics["top1"], self.step)
+                        dashboard.writer.add_scalar("eval/top5_accuracy", val_metrics["top5"], self.step)
+
                 if self.step % 50 == 0:
                     archived = self.lifecycle_manager.tick_idle(self.step)
                     if archived:
@@ -1666,6 +1817,9 @@ class MeshTrainer:
         tiers = self.tier_manager.summary()
         print(f"Training complete. {len(self.router.nodes)} nodes in mesh. "
               f"Tiers: GPU[{tiers['gpu']}] RAM[{tiers['ram']}] Disk[{tiers['disk']}]")
+
+    def save_checkpoint(self, *args, **kwargs):
+        self._save_checkpoint(*args, **kwargs)
 
     def _save_checkpoint(self, final: bool = False, latest: bool = False):
         if not final and not latest and self.step == self._last_saved_step:
@@ -1704,6 +1858,13 @@ class MeshTrainer:
             {"step": self.step, "final": final},
         )
         print(f"Checkpoint saved at step {self.step}")
+        if self.hub_sync is not None:
+            try:
+                self.hub_sync.push(self.checkpoint_dir, tag, final=final)
+                if not final:
+                    self.hub_sync.push_metadata({"step": self.step, "loss": float(sum(self.global_losses[-100:])/max(len(self.global_losses[-100:]),1))})
+            except Exception as e:
+                print(f"  HubSync push skipped ({e})")
 
     def _load_checkpoint(self, step_tag: str | int | None = None):
         ckpt_dir = self.checkpoint_dir
@@ -1773,6 +1934,41 @@ class MeshTrainer:
         print("\n\n=== SIGINT received. Will stop after current step... ===")
         print("=== Press Ctrl+C again to force exit. ===")
         self._interrupted = True
+
+    def _validate(self, val_dataset: Dataset, device: torch.device) -> dict:
+        self.router.eval()
+        total_loss = 0.0
+        total_correct_1 = 0
+        total_correct_5 = 0
+        total_seen = 0
+        n_batches = 0
+        loader = DataLoader(val_dataset, batch_size=8, shuffle=False, drop_last=False,
+                            collate_fn=lambda b: {
+                                "input_ids": torch.stack([x["input_ids"] if isinstance(x, dict) else x[0] for x in b]),
+                                "labels": torch.stack([x["labels"] if isinstance(x, dict) else x[1] for x in b]),
+                            })
+        with torch.no_grad():
+            for batch in loader:
+                x = batch["input_ids"].to(device)
+                target = batch["labels"].to(device)
+                x_emb = self._embed_tokens(x)
+                logits = self.router(x_emb, return_logits=True)
+                if isinstance(logits, tuple):
+                    logits = logits[0]
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target.view(-1), reduction="mean")
+                total_loss += loss.item()
+                probs = F.softmax(logits, dim=-1)
+                top5 = probs.topk(5, dim=-1).indices
+                target_flat = target.view(-1, 1)
+                correct_1 = (top5[:, :1] == target_flat).any(dim=-1).sum().item()
+                correct_5 = (top5 == target_flat).any(dim=-1).sum().item()
+                total_correct_1 += correct_1
+                total_correct_5 += correct_5
+                total_seen += target.numel()
+                n_batches += 1
+        self.router.train()
+        avg_loss = total_loss / max(n_batches, 1)
+        return {"loss": avg_loss, "top1": total_correct_1 / max(total_seen, 1), "top5": total_correct_5 / max(total_seen, 1)}
 
     def generate_text(self, batch_size: int = 1, max_blocks: int = 1,
                        device: torch.device | None = None) -> torch.Tensor:
