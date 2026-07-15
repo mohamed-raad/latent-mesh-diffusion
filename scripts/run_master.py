@@ -9,20 +9,27 @@ Usage on Colab:
     !python scripts/run_master.py --hub_repo mohamed99raad/Latent-Mesh-Model
 """
 
-import sys, os, time, torch
+import sys, os, time, torch, argparse
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "NoProp", "src"))
 
 from train_mesh import MeshTrainer
 
+parser = argparse.ArgumentParser()
+parser.add_argument("--hub_repo", default="mohamed99raad/Latent-Mesh-Model")
+parser.add_argument("--token", default=None)
+args, _ = parser.parse_known_args()
+if args.token:
+    os.environ["HF_TOKEN"] = args.token
+
 # ---------- config ----------
 MODEL_SIZE = "small"
 SEQ_LEN = 128
-BATCH_SIZE = 2
+BATCH_SIZE = 8
 MAX_STEPS = 50000
 LOG_INTERVAL = 50
 CKPT_INTERVAL = 500
 OUT_DIR = os.path.expanduser("~/checkpoints/mesh_master")
-HUB_REPO = "mohamed99raad/Latent-Mesh-Model"
+HUB_REPO = args.hub_repo
 NUM_SEED_EXPERTS = 8
 # ---------------------------
 

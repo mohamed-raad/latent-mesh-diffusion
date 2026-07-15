@@ -835,7 +835,6 @@ class MeshTrainer:
             self.router.register_node(node)
             with open(node.anchor_path, "w") as f:
                 f.write("# seed_default\n# Core brain — general reasoning\n#general #reasoning #planning #language\n")
-            return
 
         for path in md_files:
             meta = load_node_metadata(path)
