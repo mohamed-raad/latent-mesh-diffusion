@@ -1,6 +1,7 @@
 """
 Mesh Router — expert routing, universal latent space, planning, execution graphs.
 """
+from __future__ import annotations
 import os
 import time
 from dataclasses import asdict, dataclass, field
