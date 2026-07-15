@@ -1479,6 +1479,19 @@ class MeshTrainer:
         mesh_state = data.get("model_state_dict", {}).get("mesh", {})
         if not mesh_state:
             mesh_state = data
+
+        # Restore core model weights
+        if "token_embedding" in mesh_state:
+            self.token_embedding.load_state_dict(mesh_state["token_embedding"])
+        if "latent_space" in mesh_state:
+            self.latent_space.load_state_dict(mesh_state["latent_space"])
+        if "speculator" in mesh_state:
+            self.speculator.load_state_dict(mesh_state["speculator"])
+        if "kv_compressor" in mesh_state:
+            self.kv_compressor.load_state_dict(mesh_state["kv_compressor"])
+        if "global_cognitive_layer" in mesh_state:
+            self.global_cognitive_layer.load_state_dict(mesh_state["global_cognitive_layer"])
+
         canvas_state = mesh_state.get("canvas_state")
         if canvas_state is not None and self.canvas is not None:
             self.canvas.model.load_state_dict(canvas_state)
@@ -1516,13 +1529,17 @@ class MeshTrainer:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.tier_manager.set_device(device)
 
-        # HubSync initialisation
+        # HubSync initialisation (only if not already set in __init__)
         hub_repo = hub_repo or self.hub_repo
-        if hub_repo:
+        if hub_repo and self.hub_sync is None:
             try:
                 self.hub_sync = HubSync(repo_id=hub_repo)
-                if multi_notebook:
-                    self.hub_sync.advertise()
+            except Exception as e:
+                print(f"  HubSync init skipped ({e})")
+        if self.hub_sync is not None:
+            if multi_notebook:
+                self.hub_sync.advertise()
+            try:
                 latest = self.hub_sync.checkout_latest(self.checkpoint_dir)
                 if latest:
                     print(f"  HubSync: pulled {os.path.basename(latest)} from {hub_repo}")
@@ -1837,6 +1854,12 @@ class MeshTrainer:
             "external_nodes": self.external_nodes,
             "use_qat": getattr(self, '_qat_enabled', False),
             "qat_bits": getattr(self, 'qat_bits', 8),
+            # Core model weights (essential for resume)
+            "token_embedding": self.token_embedding.state_dict(),
+            "latent_space": self.latent_space.state_dict(),
+            "speculator": self.speculator.state_dict(),
+            "kv_compressor": self.kv_compressor.state_dict(),
+            "global_cognitive_layer": self.global_cognitive_layer.state_dict(),
         }
         if self.canvas is not None:
             state["canvas_state"] = self.canvas.model.state_dict()
@@ -1906,6 +1929,19 @@ class MeshTrainer:
             return
         self.step = mesh_state.get("step", 0)
         self.global_losses = mesh_state.get("global_losses", [])
+
+        # Restore core model weights
+        if "token_embedding" in mesh_state:
+            self.token_embedding.load_state_dict(mesh_state["token_embedding"])
+        if "latent_space" in mesh_state:
+            self.latent_space.load_state_dict(mesh_state["latent_space"])
+        if "speculator" in mesh_state:
+            self.speculator.load_state_dict(mesh_state["speculator"])
+        if "kv_compressor" in mesh_state:
+            self.kv_compressor.load_state_dict(mesh_state["kv_compressor"])
+        if "global_cognitive_layer" in mesh_state:
+            self.global_cognitive_layer.load_state_dict(mesh_state["global_cognitive_layer"])
+
         canvas_state = mesh_state.get("canvas_state")
         if canvas_state is not None and self.canvas is not None:
             self.canvas.model.load_state_dict(canvas_state)
