@@ -313,7 +313,7 @@ class TrainingOrchestrator:
         self.current_phase: str = ""
         self.current_step = 0
 
-    def get_dataset(self, config: PhaseConfig, convert_first: bool = True) -> IterableDataset:
+    def get_dataset(self, config: PhaseConfig, convert_first: bool = False) -> IterableDataset:
         """Create dataset, auto-converting HF sources to binary if needed."""
         datasets = []
         for ds_spec in config.datasets:
