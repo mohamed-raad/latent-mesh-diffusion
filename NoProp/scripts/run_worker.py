@@ -62,6 +62,7 @@ trainer = MeshTrainer(
     experts_count=8,            # must match master
     checkpoint_dir=OUT_DIR,
     hub_repo=HUB_REPO,
+    hub_token=args.token,
 )
 
 # 2. Pull core from Hub (loads latest master checkpoint)

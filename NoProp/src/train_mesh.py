@@ -738,6 +738,11 @@ class MeshTrainer:
         self.experts_count = experts_count
         self.hub_repo = hub_repo
         self.hub_sync: HubSync | None = None
+        if hub_repo:
+            try:
+                self.hub_sync = HubSync(repo_id=hub_repo, token=hub_token)
+            except Exception as e:
+                print(f"  HubSync init skipped ({e})")
 
         self.dynamic_quantizer = DynamicQuantizer(patience=quant_patience) if use_dynamic_quant else None
         self.expert_registry = ExpertRegistry(expert_registry_path) if expert_registry_path else None

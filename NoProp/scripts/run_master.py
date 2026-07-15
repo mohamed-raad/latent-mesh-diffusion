@@ -62,6 +62,7 @@ trainer = MeshTrainer(
     experts_count=NUM_SEED_EXPERTS, # how many to auto-create
     checkpoint_dir=OUT_DIR,
     hub_repo=HUB_REPO,
+    hub_token=args.token,
 )
 
 # FREEZE all expert nodes — master only trains the core
